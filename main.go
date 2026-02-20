@@ -9,11 +9,13 @@ import (
 	"encoding/pem"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -58,7 +60,8 @@ func main() {
 		port         = flag.String("port", "8080", "Local server port for OAuth callback")
 		repo         = flag.String("repo", "", "Repository in format 'owner/repo'")
 		keyTitle     = flag.String("title", "", "Title for the deploy key")
-		readOnly     = flag.Bool("read-only", true, "Create read-only deploy key")
+		readOnly     = flag.Bool("read-only", false, "Create read-only deploy key (default: false, i.e., write access)")
+		writeAccess  = flag.Bool("write", false, "Create deploy key with write access (overrides -read-only)")
 		help         = flag.Bool("help", false, "Show help")
 	)
 	flag.Parse()
@@ -81,6 +84,13 @@ func main() {
 		Port:         *port,
 	}
 
+	// Determine if key should be read-only
+	// If -write flag is set, it overrides -read-only
+	isReadOnly := *readOnly
+	if *writeAccess {
+		isReadOnly = false
+	}
+
 	fmt.Println("🚀 GitHub Deploy Key CLI Tool")
 	fmt.Println("==============================")
 
@@ -99,8 +109,12 @@ func main() {
 	}
 
 	// Step 3: Create deploy key
-	fmt.Printf("🔑 Creating deploy key '%s' for repository '%s'...\n", *keyTitle, *repo)
-	deployKey, err := client.createDeployKey(*repo, *keyTitle, publicKey, *readOnly)
+	accessType := "read-only"
+	if !isReadOnly {
+		accessType = "read-write"
+	}
+	fmt.Printf("🔑 Creating %s deploy key '%s' for repository '%s'...\n", accessType, *keyTitle, *repo)
+	deployKey, err := client.createDeployKey(*repo, *keyTitle, publicKey, isReadOnly)
 	if err != nil {
 		log.Fatalf("Failed to create deploy key: %v", err)
 	}
@@ -112,18 +126,39 @@ func main() {
 		log.Fatalf("Failed to save private key: %v", err)
 	}
 
+	// Step 5: Update SSH config
+	fmt.Println("🔧 Updating SSH config...")
+	repoName := extractRepoName(*repo)
+	currentDir, err := os.Getwd()
+	if err != nil {
+		log.Fatalf("Failed to get current directory: %v", err)
+	}
+	keyPath := filepath.Join(currentDir, keyFileName)
+
+	err = updateSSHConfig(repoName, keyPath)
+	if err != nil {
+		log.Printf("⚠️  Warning: Failed to update SSH config: %v", err)
+		log.Println("   You can manually add the SSH config entry.")
+	} else {
+		fmt.Println("✅ SSH config updated successfully!")
+	}
+
 	// Success message
 	fmt.Println("\n✅ Deploy key created successfully!")
 	fmt.Printf("   📋 Key ID: %d\n", deployKey.ID)
 	fmt.Printf("   📝 Title: %s\n", deployKey.Title)
 	fmt.Printf("   📁 Private key saved to: %s\n", keyFileName)
 	fmt.Printf("   🔗 GitHub URL: %s\n", deployKey.URL)
-	fmt.Printf("   🔒 Read-only: %t\n", *readOnly)
+	if isReadOnly {
+		fmt.Printf("   🔒 Access: Read-only\n")
+	} else {
+		fmt.Printf("   ✍️  Access: Read-write\n")
+	}
 
 	fmt.Println("\n📋 Usage Instructions:")
 	fmt.Println("   Add this to your CI/CD or deployment configuration:")
 	fmt.Printf("   ssh-add %s\n", keyFileName)
-	fmt.Println("   git clone git@github.com:" + *repo + ".git")
+	fmt.Printf("   git clone git@github.com-%s:%s.git\n", repoName, *repo)
 }
 
 func printHelp() {
@@ -148,15 +183,29 @@ func printHelp() {
 	fmt.Println()
 	fmt.Println("Optional flags:")
 	fmt.Println("  -port string          Local server port (default: 8080)")
-	fmt.Println("  -read-only            Create read-only deploy key (default: true)")
+	fmt.Println("  -write                Create deploy key with write access (default: false)")
+	fmt.Println("  -read-only            Create read-only deploy key (default: false)")
 	fmt.Println("  -help                 Show this help")
 	fmt.Println()
-	fmt.Println("Example:")
+	fmt.Println("Note: By default, deploy keys are created with write access.")
+	fmt.Println("      Use -read-only flag to create a read-only key.")
+	fmt.Println("      Use -write flag to explicitly enable write access.")
+	fmt.Println()
+	fmt.Println("Example (write access):")
 	fmt.Println("  go run main.go \\")
 	fmt.Println("    -client-id=your_client_id \\")
 	fmt.Println("    -client-secret=your_client_secret \\")
 	fmt.Println("    -repo=owner/repository \\")
-	fmt.Println("    -title=\"Production Deploy Key\"")
+	fmt.Println("    -title=\"Production Deploy Key\" \\")
+	fmt.Println("    -write")
+	fmt.Println()
+	fmt.Println("Example (read-only access):")
+	fmt.Println("  go run main.go \\")
+	fmt.Println("    -client-id=your_client_id \\")
+	fmt.Println("    -client-secret=your_client_secret \\")
+	fmt.Println("    -repo=owner/repository \\")
+	fmt.Println("    -title=\"Read-Only Deploy Key\" \\")
+	fmt.Println("    -read-only")
 }
 
 func generateSSHKeyPair() (string, string, error) {
@@ -252,7 +301,7 @@ func authenticateWithGitHub(config *Config) (*GitHubClient, error) {
 	defer cancel()
 	server.Shutdown(ctx)
 
-	// Exchange authorization code for access token
+	// Exchange athorization code for access token
 	fmt.Println("🔄 Exchanging authorization code for access token...")
 	accessToken, err := exchangeCodeForToken(config, code)
 	if err != nil {
@@ -338,10 +387,29 @@ func (c *GitHubClient) createDeployKey(repo, title, publicKey string, readOnly b
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusCreated {
+		// Capture raw response body to aid debugging of 4xx/5xx errors.
+		rawBody, _ := io.ReadAll(resp.Body)
 		var errorResp struct {
-			Message string `json:"message"`
+			Message          string           `json:"message"`
+			DocumentationURL string           `json:"documentation_url"`
+			Errors           []map[string]any `json:"errors"`
 		}
-		json.NewDecoder(resp.Body).Decode(&errorResp)
+		_ = json.Unmarshal(rawBody, &errorResp)
+
+		log.Printf("Deploy key creation failed. repo=%q status=%d url=%q", repo, resp.StatusCode, url)
+		if len(rawBody) > 0 {
+			log.Printf("GitHub API response body: %s", strings.TrimSpace(string(rawBody)))
+		}
+		if errorResp.Message != "" {
+			log.Printf("GitHub API message: %s", errorResp.Message)
+		}
+		if errorResp.DocumentationURL != "" {
+			log.Printf("GitHub API docs: %s", errorResp.DocumentationURL)
+		}
+		if len(errorResp.Errors) > 0 {
+			log.Printf("GitHub API errors: %+v", errorResp.Errors)
+		}
+
 		return nil, fmt.Errorf("GitHub API error (status %d): %s", resp.StatusCode, errorResp.Message)
 	}
 
@@ -367,6 +435,62 @@ func savePrivateKey(fileName, privateKey string) error {
 
 	_, err = file.WriteString(privateKey)
 	return err
+}
+
+func extractRepoName(repo string) string {
+	// Extract repository name from "owner/repo" format
+	parts := strings.Split(repo, "/")
+	if len(parts) == 2 {
+		return parts[1]
+	}
+	return repo
+}
+
+func updateSSHConfig(repoName, keyPath string) error {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("failed to get home directory: %w", err)
+	}
+
+	sshConfigPath := filepath.Join(homeDir, ".ssh", "config")
+
+	// Read existing config file if it exists
+	var existingContent string
+	if data, err := os.ReadFile(sshConfigPath); err == nil {
+		existingContent = string(data)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("failed to read SSH config: %w", err)
+	}
+
+	// Check if this host entry already exists
+	hostEntry := fmt.Sprintf("Host github.com-%s", repoName)
+	if strings.Contains(existingContent, hostEntry) {
+		log.Printf("SSH config entry for %s already exists, skipping update", repoName)
+		return nil
+	}
+
+	// Create the new SSH config entry
+	newEntry := fmt.Sprintf("\nHost github.com-%s\n  Hostname github.com\n  User bldmgr\n  IdentityFile=%s\n  IdentitiesOnly yes\n",
+		repoName, keyPath)
+
+	// Ensure .ssh directory exists
+	sshDir := filepath.Join(homeDir, ".ssh")
+	if err := os.MkdirAll(sshDir, 0700); err != nil {
+		return fmt.Errorf("failed to create .ssh directory: %w", err)
+	}
+
+	// Append to SSH config
+	file, err := os.OpenFile(sshConfigPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return fmt.Errorf("failed to open SSH config: %w", err)
+	}
+	defer file.Close()
+
+	if _, err := file.WriteString(newEntry); err != nil {
+		return fmt.Errorf("failed to write to SSH config: %w", err)
+	}
+
+	return nil
 }
 
 func openBrowser(url string) error {
